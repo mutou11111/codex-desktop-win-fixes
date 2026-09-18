@@ -20,6 +20,7 @@
 - [7. 桌面版崩了怎么临时继续干活](#7-桌面版崩了怎么临时继续干活)
 - [8. 排查工具箱：日志位置与关键词](#8-排查工具箱日志位置与关键词)
 - [9. 经验教训（最重要的一节）](#9-经验教训最重要的一节)
+- [10. 补充案例：如何判定"这是客户端缺陷，不是我环境的问题"](#10-补充案例如何判定这是客户端缺陷不是我环境的问题)
 
 ---
 
@@ -497,14 +498,144 @@ Store/MSIX 应用**不能用 `winget` 装回来**（`winget` 里的 `OpenAI.Code
 
 | 组件 | 版本 |
 | --- | --- |
-| 应用包 | `26.915.3509.0` |
-| 应用内部标识 | `26.915.31029` |
-| 随附 CLI | `codex-cli 0.155.0-alpha.9` |
+| 应用包 | `26.915.3509.0` → `26.915.4065.0` |
+| 应用内部标识 | `26.915.31029` → `26.915.31945` |
+| 随附 CLI | `codex-cli 0.155.0-alpha.9` → `0.155.0-alpha.9.2` |
 
 > 应用自带 CLI 的版本会随每次更新而变。
 > 验证方式：对比 `%LOCALAPPDATA%\OpenAI\Codex\bin\<哈希>\codex.exe`
 > 与应用包内 `app\resources\codex.exe` 的**文件大小是否一致**——
 > 一致即为同一个二进制。
+
+---
+
+## 10. 补充案例：如何判定"这是客户端缺陷，不是我环境的问题"
+
+本节记录一次**最终没能靠本地操作修复**的故障，以及**如何尽早判断"该找官方修"**，
+避免在无望的方向上继续消耗时间。
+
+### 症状（本次见到的最终形态）
+
+| 场景 | 表现 |
+| --- | --- |
+| **全新对话** | **第 1 条能发，第 2 条发不出**（按钮变灰） |
+| **任何已有对话** | **一律发不出**（按钮灰） |
+| 服务端日志 | 回合 `task_complete` **正常结束** |
+| 应用日志 | **零错误** |
+| 关闭应用 | 卡死，弹出大量"无法终止"，需反复确认 |
+
+> 注意"新对话能发第一条"这个细节很容易被忽略：
+> 它说明**收发通路本身是通的**，坏的是"一轮结束后状态复位"这一环。
+
+### 逐项排除清单（全部实测）
+
+| 怀疑项 | 排除依据 |
+| --- | --- |
+| 上下文超限 | 短对话同样失败 |
+| 运行时缺失 | 重装后应用**自己**完成部署：`relocation 失败 0`、`source=missing 0` |
+| CLI 版本不匹配 | CLI 二进制与应用包内**字节一致** |
+| `config.toml` 陈旧 | 删掉让它重建，无效 |
+| 模型缓存 | 7 个模型齐全，缓存刚刷新过 |
+| 写锁残留 | 锁文件未被占用 |
+| 线程迁移卡住 | 修正迁移标记后，无效 |
+| 标签页恢复卡住 | 关掉全部标签页，无效 |
+| 归档状态 | 受影响的对话在"活动"目录 |
+| 工作目录 / 可写根 | 全部存在 |
+| 界面缓存过期 | `Ctrl+R` 强制重载，无效 |
+| **杀毒软件** | **整体退出杀软后问题依旧 → 彻底排除** |
+| 内存不足 | 64 GB 总量、可用 38 GB |
+
+### 系统级证据（判定"应用自己坏了"的关键）
+
+这类证据**不在应用自己的日志里**，需要查系统事件日志：
+
+**① 应用是否在挂起（无响应）**
+
+```powershell
+Get-WinEvent -FilterHashtable @{
+    LogName='Application'; ProviderName='Windows Error Reporting'
+    StartTime=(Get-Date).AddDays(-3)
+} -ErrorAction SilentlyContinue |
+  Where-Object { $_.Message -match 'OpenAI.Codex' } |
+  Select-Object TimeCreated, @{n='Type';e={
+      if ($_.Message -match 'MoAppHang')      { '挂起 Hang' }
+      elseif ($_.Message -match 'MoAppCrash') { '崩溃 Crash' }
+      else                                    { '其它' }
+  }}
+```
+
+实测结果：**3 天内 6 次 `MoAppHang`（应用无响应）**。
+
+**② 后端进程是否异常退出**
+
+```powershell
+$logs = Get-ChildItem "$env:LOCALAPPDATA\Codex\Logs" -Recurse -Filter "*.log"
+$logs | Select-String -Pattern 'Codex CLI process exited' |
+  ForEach-Object { $_.Line } | Sort-Object -Unique
+```
+
+实测结果：
+
+- `Codex CLI process exited classifiedAsExpected=false code=1 signal=null`
+- 而且**该进程退出前的最后一条日志是一条无害的插件警告**
+  → **没有任何崩溃原因**，这是"被异常终止"而非"自己崩溃"的典型特征
+  （自身崩溃通常会留下 panic / backtrace）
+
+**③ 会话状态是否对不上**
+
+```powershell
+$logs | Select-String -Pattern 'Conversation state not found|for unknown conversation' |
+  Group-Object Pattern | Select-Object Count, Name
+```
+
+实测结果：`Conversation state not found` 8 次、`Received turn/started|turn/completed for unknown conversation` 30 次。
+
+### 三条判据：什么时候该停止折腾自己的机器
+
+**三条同时成立**时，继续改配置、重装、清缓存都**不会有结果**：
+
+1. **服务端有完成记录，客户端却没有反应** → 坏在客户端接收侧
+2. **排除清单全绿**（尤其：整体退出杀软后依旧）→ 环境无责
+3. **有系统级证据**（应用挂起 `MoAppHang` / 后端进程异常退出且无错误信息）→ 应用自身缺陷
+
+此时正确的动作是：**提 issue + 切换到替代通路**，而不是继续本地排查。
+
+### 替代通路（本次采用的方案）
+
+终端 CLI 与桌面版**共用同一份会话记录**（见 §7），所以桌面版坏了也能继续干活：
+
+```powershell
+codex resume --all
+```
+
+已实测可正常收发消息；且**终端期间产生的对话，桌面版恢复后能完整继承**。
+
+### 已知无效的尝试（列出以免重复浪费时间）
+
+| 尝试 | 结果 |
+| --- | --- |
+| 重启应用 | 无效 |
+| 卸载 + 重装应用 | 无效 |
+| 删除 `config.toml` 让它重新生成 | 无效 |
+| 更新到最新版本 | 无效 |
+| 修正卡住的线程迁移状态 | 无效 |
+| 关闭所有标签页 | 无效 |
+| `Ctrl+R` 强制重载界面 | 无效 |
+| 整体退出杀毒软件 | 无效（**但这条很有价值：一次性排除了杀软**） |
+
+### 一个仍未定性的观察
+
+Electron 日志中反复出现：
+
+```
+warning [IpcClient] Received broadcast but no handler is configured
+        method=thread-stream-following-changed
+```
+
+累计出现 **994 次**。从命名推测它与"某条会话的流是否正在被跟随"有关
+（即可能承载"这一轮已结束"的信号），若界面未处理该广播，
+就会表现为"永远认为还在生成中"。但 `Ctrl+R` 强制重载界面后问题依旧，
+**机制未能确认**，仅作为线索记录。
 
 ---
 
